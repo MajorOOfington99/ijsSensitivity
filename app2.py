@@ -48,15 +48,22 @@ fall_value = st.sidebar.slider("Fall Deduction (points per fall)", min_value=0, 
                                 help="Points deducted for each fall. (1.0 is the current rule):contentReference[oaicite:2]{index=2}")
 
 # Recalculate scores under new parameters
+# Ensure numeric types to avoid string-wise mins
+event_df["Base_Value"] = pd.to_numeric(event_df["Base_Value"], errors="coerce")
+event_df["GOE_Base"] = pd.to_numeric(event_df["GOE_Base"], errors="coerce")
+event_df["GOE_Mid7_Avg"] = pd.to_numeric(event_df["GOE_Mid7_Avg"], errors="coerce")
+
 # Scale base values
-event_df["Base_Value_new"] = event_df["Base_Value"] * base_scale
-event_df["GOE_Base_new"] = event_df["GOE_Base"] * base_scale
+event_df["Base_Value_new"] = (event_df["Base_Value"] * base_scale).astype(float)
+event_df["GOE_Base_new"] = (event_df["GOE_Base"] * base_scale).astype(float)
 # (Note: Base_Value in the data already includes second-half 1.1 bonuses where applicable:contentReference[oaicite:3]{index=3}, 
 # and GOE_Base is the base of the most difficult jump in a combo:contentReference[oaicite:4]{index=4}.)
 
 # Compute new GOE points for each element
 # Use the smaller of executed base and GOE base to avoid over-penalizing downgraded elements
-event_df["GOE_Base_used"] = event_df[["Base_Value_new", "GOE_Base_new"]].min(axis=1)
+event_df["GOE_Base_used"] = pd.concat(
+    [event_df["Base_Value_new"], event_df["GOE_Base_new"]], axis=1
+).min(axis=1, skipna=True)
 event_df["GOE_points_new"] = event_df["GOE_Mid7_Avg"] * (GOE_pct / 100.0) * event_df["GOE_Base_used"]
 # Round GOE points to two decimals (as in official scoring):contentReference[oaicite:5]{index=5}
 event_df["GOE_points_new"] = event_df["GOE_points_new"].round(2)
