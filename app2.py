@@ -55,7 +55,9 @@ event_df["GOE_Base_new"] = event_df["GOE_Base"] * base_scale
 # and GOE_Base is the base of the most difficult jump in a combo:contentReference[oaicite:4]{index=4}.)
 
 # Compute new GOE points for each element
-event_df["GOE_points_new"] = event_df["GOE_Mid7_Avg"] * (GOE_pct / 100.0) * event_df["GOE_Base_new"]
+# Use the smaller of executed base and GOE base to avoid over-penalizing downgraded elements
+event_df["GOE_Base_used"] = event_df[["Base_Value_new", "GOE_Base_new"]].min(axis=1)
+event_df["GOE_points_new"] = event_df["GOE_Mid7_Avg"] * (GOE_pct / 100.0) * event_df["GOE_Base_used"]
 # Round GOE points to two decimals (as in official scoring):contentReference[oaicite:5]{index=5}
 event_df["GOE_points_new"] = event_df["GOE_points_new"].round(2)
 
