@@ -453,7 +453,7 @@ summary_display.rename(
         "Original_Rank": "OriginalRank",
         "New_Rank": "NewRank",
         "Total_Segment_Score": "OrigScore",
-        "Total_Segment_Score_new": "NewProgramScore",
+        "Total_Segment_Score_new": "New Score",
         "Rank_Change": "ProgramRankChange",
         "Original_Total_Score": "OrigTotalScore",
         "New_Total_Score": "NewTotalScore",
@@ -464,7 +464,7 @@ summary_display.rename(
     inplace=True,
 )
 
-for c in ["OrigScore", "NewProgramScore", "OrigTotalScore", "NewTotalScore"]:
+for c in ["OrigScore", "New Score", "OrigTotalScore", "NewTotalScore"]:
     summary_display[c] = pd.to_numeric(summary_display[c], errors="coerce").round(2)
 
 for c in ["OrigOverallRank", "NewOverallRank", "TotalRankChange"]:
@@ -496,7 +496,7 @@ styled_summary = (
     .format(
         {
             "OrigScore": "{:.2f}",
-            "NewProgramScore": "{:.2f}",
+            "New Score": "{:.2f}",
             "OrigTotalScore": lambda v: "–" if pd.isna(v) else f"{float(v):.2f}",
             "NewTotalScore": lambda v: "–" if pd.isna(v) else f"{float(v):.2f}",
             "ProgramRankChange": _format_rank_change,
