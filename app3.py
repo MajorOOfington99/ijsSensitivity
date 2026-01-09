@@ -14,7 +14,7 @@ st.title("ISU Score Simulation Dashboard")
 
 st.markdown(
     "This dashboard lets you test **figure skating scoring rule changes** on historical competition data. "
-    "Adjust the parameters in the sidebar (GOE scaling, base value scale, fall deduction, and SOV levers) "
+    "Adjust the parameters in the sidebar (GOE scaling, base value scale, fall logic, and SOV levers) "
     "to simulate how new rules would affect scores and placements. Select a competition segment, and view the "
     "recalculated rankings and each skater’s element-by-element score breakdown under the new rules."
 )
@@ -22,18 +22,26 @@ st.markdown(
 # -----------------------------
 # Data loading
 # -----------------------------
+def _first_existing(*paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            return p
+    return None
+
 @st.cache_data
 def load_data():
     base_df = None
     sim_df = None
 
-    if os.path.exists("base_value.csv"):
-        base_df = pd.read_csv("base_value.csv")
-    if os.path.exists("isu_simulation.csv"):
-        sim_df = pd.read_csv("isu_simulation.csv")
+    base_path = _first_existing("base_value.csv", "/mnt/data/base_value.csv")
+    sim_path  = _first_existing("isu_simulation.csv", "/mnt/data/isu_simulation.csv")
+
+    if base_path:
+        base_df = pd.read_csv(base_path)
+    if sim_path:
+        sim_df = pd.read_csv(sim_path)
 
     return base_df, sim_df
-
 
 base_values, df_sim = load_data()
 
@@ -63,7 +71,7 @@ if missing:
     st.error(f"`isu_simulation.csv` is missing required columns: {missing}")
     st.stop()
 
-has_goe_base = "GOE_Base" in df_sim.columns
+has_info_col = "Info_Column" in df_sim.columns
 
 # -----------------------------
 # Sidebar - Event selection
@@ -97,9 +105,9 @@ if event_df_raw.empty:
 st.sidebar.header("Simulation Parameters")
 
 GOE_pct = st.sidebar.slider(
-    "GOE value per ±1 GOE (percent of base)",
+    "GOE value per ±1 GOE (percent of GOE reference base)",
     min_value=5, max_value=20, value=10, step=1,
-    help="Percentage of GOE reference base for each +1 or -1 GOE. (10% is the common current rule)"
+    help="Your dataset’s GOE points are consistent with 10% per GOE step. This slider changes that %."
 )
 
 base_scale = st.sidebar.slider(
@@ -111,11 +119,43 @@ base_scale = st.sidebar.slider(
 fall_value = st.sidebar.slider(
     "Fall Deduction (points per fall)",
     min_value=0, max_value=3, value=1, step=1,
-    help="Points deducted for each fall. (1.0 is the current rule)"
+    help="Points deducted for each fall. (1.0 matches how this dataset is constructed.)"
 )
 
 # -----------------------------
-# NEW: SOV adjustments by element type (±20%)
+# NEW: Fall rule toggle (BV -50% and NO -1 fall deduction)
+# -----------------------------
+with st.sidebar.expander("Fall rule experiment", expanded=False):
+    fall_bv_penalty_mode = st.checkbox(
+        "If an element has a fall: cut that element’s base value by 50% AND remove the -1 fall deduction",
+        value=False
+    )
+    st.caption(
+        "When enabled: any element whose Info column contains `F` gets a 0.50 multiplier applied to base value "
+        "(and proportional GOE). The fall deduction is set to 0. Other (non-fall) deductions are left unchanged."
+        + ("" if has_info_col else " (Note: your file has no Info_Column; fall detection will fall back to parsing Element_Name.)")
+    )
+
+# -----------------------------
+# NEW: Under-rotation call levers (±20% on BV for q / < / <<)
+# -----------------------------
+with st.sidebar.expander("Jump call scaling: q / < / << (±20% BV sensitivity)", expanded=False):
+    st.caption(
+        "Apply a separate ±% multiplier to base values (and proportional GOE) for elements with rotation calls. "
+        "Detection uses the protocol Info column when available."
+    )
+    q_adj_pct = st.slider("q adjustment (%)", min_value=-20, max_value=20, value=0, step=1)
+    lt_adj_pct = st.slider("< adjustment (%)", min_value=-20, max_value=20, value=0, step=1)
+    ltlt_adj_pct = st.slider("<< adjustment (%)", min_value=-20, max_value=20, value=0, step=1)
+
+ur_scales = {
+    "q": 1.0 + (q_adj_pct / 100.0),
+    "<": 1.0 + (lt_adj_pct / 100.0),
+    "<<": 1.0 + (ltlt_adj_pct / 100.0),
+}
+
+# -----------------------------
+# SOV adjustments by element type (±20%)
 # -----------------------------
 SOV_TYPES = ["Jump", "Spin", "Step", "Choreo", "Lift", "Twist", "Death Spiral"]
 
@@ -134,7 +174,7 @@ with st.sidebar.expander("Scale of Values (SOV) by element type (±20%)", expand
 type_scales = {t: 1.0 + (type_adj_pct[t] / 100.0) for t in SOV_TYPES}
 
 # -----------------------------
-# NEW: Jump rotation levers (±20%)
+# Jump rotation levers (±20%)
 # -----------------------------
 ROT_BUCKETS = [
     (1, "Single (1)"),
@@ -176,64 +216,81 @@ def _ensure_bool_second_half(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df
 
-def classify_element(element_name: str) -> str:
-    name = (element_name or "").replace(" ", "").lower()
-
-    # Pairs heuristics (your original intent)
-    is_pairs = any(tag in name for tag in ["th", "li", "ds", "tw", "pcossp"])
-    if is_pairs:
-        if "li" in name:
-            return "Lift"
-        if "ds" in name:
-            return "Death Spiral"
-        if "tw" in name:
-            return "Twist"
-        if "sp" in name or "pcossp" in name:
-            return "Spin"
-        if "chsq" in name:
-            return "Choreo"
-        if "sq" in name:
-            return "Step"
-        return "Jump"
-
-    if "chsq" in name:
-        return "Choreo"
-    if "sq" in name:
-        return "Step"
-    if "sp" in name:
-        return "Spin"
-    return "Jump"
-
-def parse_jump_rotation_bucket(element_name: str) -> int | None:
+def parse_jump_rotation_bucket(element_name: str):
     """
     For a *jump element row*, infer rotation bucket (1..5) by scanning jump tokens.
     We take the MAX rotation found in the element string (e.g., 4T+3T -> 4).
     """
     if element_name is None or (isinstance(element_name, float) and np.isnan(element_name)):
-        return None
+        return np.nan
 
     s = str(element_name).strip()
     if not s:
-        return None
+        return np.nan
 
-    # normalize & remove common symbols/annotations that can confuse tokenization
     s = s.replace(" ", "")
     s = re.sub(r"\+REP", "", s, flags=re.IGNORECASE)
 
-    # split combos/sequences into parts (3Lz+3T+2T etc.)
     parts = re.split(r"\+", s)
-
-    rots: list[int] = []
+    rots = []
     for p in parts:
-        # strip non-alnum to make matching safer (removes <, <<, !, q, etc.)
+        # remove call annotations (<, <<, !, q, e, etc.) safely
         p2 = re.sub(r"[^0-9A-Za-z]", "", p)
         m = re.match(r"^([1-5])", p2)
         if m:
             rots.append(int(m.group(1)))
 
-    if not rots:
-        return None
-    return max(rots)
+    return float(max(rots)) if rots else np.nan
+
+def _type_from_dataset(df: pd.DataFrame) -> pd.Series:
+    """
+    Prefer the dataset's Element_Type if present; otherwise fall back to string heuristics.
+    Returns categories in: Jump / Spin / Step / Choreo / (other Title Cased).
+    """
+    if "Element_Type" in df.columns:
+        s = df["Element_Type"].astype(str).str.strip().str.lower()
+        s = s.replace({"jump": "Jump", "spin": "Spin", "step": "Step", "choreo": "Choreo"})
+        s = s.where(s.isin(["Jump", "Spin", "Step", "Choreo"]), s.str.title())
+        return s
+
+    # fallback heuristic on Element_Name
+    name = df["Element_Name"].astype(str).str.replace(" ", "", regex=False).str.lower()
+    out = pd.Series(np.where(name.str.contains("chsq"), "Choreo",
+                    np.where(name.str.contains("sq"), "Step",
+                    np.where(name.str.contains("sp"), "Spin", "Jump"))),
+                    index=df.index)
+    return out
+
+def _extract_call_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Uses Info_Column when available; otherwise falls back to Element_Name.
+    Outputs boolean columns:
+      Call_F, Call_q, Call_<, Call_<<
+    """
+    if "Info_Column" in df.columns:
+        info = df["Info_Column"].fillna("").astype(str)
+    else:
+        info = df["Element_Name"].fillna("").astype(str)
+
+    # Token boundary = non-alphanumeric (handles separators like space, '|', etc.)
+    pat_F = r"(?:^|[^A-Za-z0-9])F(?:[^A-Za-z0-9]|$)"
+    pat_q = r"(?:^|[^A-Za-z0-9])q(?:[^A-Za-z0-9]|$)"
+    pat_lt = r"(?:^|[^A-Za-z0-9])<(?:[^A-Za-z0-9]|$)"
+
+    call_f = info.str.contains(pat_F, case=False, regex=True, na=False)
+    call_q = info.str.contains(pat_q, case=False, regex=True, na=False)
+    call_ltlt = info.str.contains("<<", regex=False, na=False)
+    call_lt = info.str.contains(pat_lt, regex=True, na=False) & (~call_ltlt)
+
+    return pd.DataFrame(
+        {
+            "Call_F": call_f,
+            "Call_q": call_q,
+            "Call_<": call_lt,
+            "Call_<<": call_ltlt,
+        },
+        index=df.index,
+    )
 
 def compute_segment_summaries(
     df_in: pd.DataFrame,
@@ -241,9 +298,12 @@ def compute_segment_summaries(
     bv_scale: float,
     fall_pts: float,
     *,
-    type_scales: dict | None = None,
-    rot_scales: dict | None = None
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    type_scales=None,
+    rot_scales=None,
+    ur_scales=None,
+    fall_bv_penalty_mode: bool = False,
+    fall_bv_multiplier: float = 0.50
+):
     """
     Returns:
       df_elements: element-level with Base_Value_new / GOE_points_new / Element_Score_new (+ audit columns)
@@ -253,6 +313,8 @@ def compute_segment_summaries(
         type_scales = {}
     if rot_scales is None:
         rot_scales = {}
+    if ur_scales is None:
+        ur_scales = {"q": 1.0, "<": 1.0, "<<": 1.0}
 
     df = df_in.copy()
     df = _ensure_bool_second_half(df)
@@ -263,11 +325,9 @@ def compute_segment_summaries(
         "Total_Element_Score", "Total_Component_Score", "Total_Deductions", "Total_Segment_Score",
     ]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "GOE_Base" in df.columns:
-        df["GOE_Base"] = pd.to_numeric(df["GOE_Base"], errors="coerce")
 
     # classify element type
-    df["Element_Type_sim"] = df["Element_Name"].astype(str).apply(classify_element)
+    df["Element_Type_sim"] = _type_from_dataset(df)
     df["Type_Scale"] = df["Element_Type_sim"].map(type_scales).fillna(1.0).astype(float)
 
     # rotation bucket ONLY for jumps
@@ -275,45 +335,49 @@ def compute_segment_summaries(
     df["Jump_Rotation"] = np.nan
     if jump_mask.any():
         df.loc[jump_mask, "Jump_Rotation"] = df.loc[jump_mask, "Element_Name"].apply(parse_jump_rotation_bucket)
-
     df["Rotation_Scale"] = df["Jump_Rotation"].map(rot_scales).fillna(1.0).astype(float)
 
-    # detect REP
-    rep_mask = df["Element_Name"].astype(str).str.contains(r"\+REP", case=False, na=False)
+    # call flags: F / q / < / <<
+    call_flags = _extract_call_flags(df)
+    df = pd.concat([df, call_flags], axis=1)
 
-    # avoid double-REP if CSV already applied it
-    rep_already_applied = True  # safe default
-    if rep_mask.any() and ("GOE_Base" in df.columns):
-        name_no_rep = df["Element_Name"].astype(str).str.replace(r"\+REP", "", regex=True, case=False)
-        clean_calls = ~name_no_rep.str.contains(r"<<|<|q|e|!", case=False, na=False)
-        clean_rep = rep_mask & clean_calls & (~df["Second_Half"].fillna(False))
+    # Under-rotation call scaling (multiplicative)
+    ur = np.ones(len(df), dtype=float)
+    ur *= np.where(df["Call_q"], float(ur_scales.get("q", 1.0)), 1.0)
+    ur *= np.where(df["Call_<<"], float(ur_scales.get("<<", 1.0)),
+                   np.where(df["Call_<"], float(ur_scales.get("<", 1.0)), 1.0))
+    df["UR_Scale"] = ur
 
-        if clean_rep.any():
-            expected = df.loc[clean_rep, "GOE_Base"] * 0.70
-            actual = df.loc[clean_rep, "Base_Value"]
-            rep_already_applied = ((actual - expected).abs() <= 0.03).any()
-
-    rep_mult = 0.70 if (rep_mask.any() and (not rep_already_applied)) else 1.00
+    # Fall BV penalty (when enabled): element gets 0.50 multiplier (and proportional GOE), and fall deductions removed
+    if fall_bv_penalty_mode:
+        df["Fall_BV_Scale"] = np.where(df["Call_F"], float(fall_bv_multiplier), 1.0).astype(float)
+        fall_pts_effective = 0.0
+    else:
+        df["Fall_BV_Scale"] = 1.0
+        fall_pts_effective = float(fall_pts)
 
     # combined base scale used per-row
-    df["BV_Scale_Used"] = (float(bv_scale) * df["Type_Scale"] * df["Rotation_Scale"]).astype(float)
+    df["BV_Scale_Used"] = (
+        float(bv_scale) * df["Type_Scale"] * df["Rotation_Scale"] * df["UR_Scale"] * df["Fall_BV_Scale"]
+    ).astype(float)
 
-    # base value scaling (+ optional REP application)
+    # base value scaling
     df["Base_Value_new"] = (df["Base_Value"] * df["BV_Scale_Used"]).astype(float)
-    if rep_mult != 1.00:
-        df.loc[rep_mask, "Base_Value_new"] = (df.loc[rep_mask, "Base_Value_new"] * rep_mult).astype(float)
 
     # GOE scaling
     is_chsq = df["Element_Name"].astype(str).str.contains("chsq", case=False, na=False)
 
-    # For most elements: scale protocol GOE proportionally with BV changes
+    # For most elements: scale protocol GOE proportionally with BV changes.
+    # Your dataset's GOE column is already "points under 10% per GOE step", so this rescales cleanly.
     df["GOE_points_new"] = (
         df["GOE"].fillna(0.0) * (float(goe_pct) / 10.0) * df["BV_Scale_Used"]
     ).astype(float)
 
-    # For ChSq: keep fixed-step approach, and only apply the CHOREO type lever (no rotation lever)
+    # For ChSq: fixed-step approach; apply only the Choreo type lever + fall BV penalty (if enabled)
     df.loc[is_chsq, "GOE_points_new"] = (
-        df.loc[is_chsq, "GOE_Mid7_Avg"].fillna(0.0) * CHSQ_STEP_POINTS * df.loc[is_chsq, "Type_Scale"]
+        df.loc[is_chsq, "GOE_Mid7_Avg"].fillna(0.0) * CHSQ_STEP_POINTS
+        * df.loc[is_chsq, "Type_Scale"]
+        * df.loc[is_chsq, "Fall_BV_Scale"]
     ).astype(float)
 
     df["GOE_points_new"] = df["GOE_points_new"].round(2)
@@ -329,28 +393,22 @@ def compute_segment_summaries(
             Total_Deductions=("Total_Deductions", "first"),
             Total_Segment_Score=("Total_Segment_Score", "first"),
             Original_Rank=("Rank", "first"),
+            Falls=("Call_F", "sum"),
         )
     )
+    seg["Falls"] = seg["Falls"].fillna(0).astype(int)
 
-    # reconcile deductions so default matches, and only "fall lever" changes the fall portion
+    # audit: reconciliation (should be ~ equal to Total_Deductions)
     seg["Deductions_Effective"] = (
         seg["Total_Segment_Score"] - seg["Total_Element_Score"] - seg["Total_Component_Score"]
     ).round(2)
 
-    seg["Falls"] = (
-        pd.to_numeric(seg["Deductions_Effective"], errors="coerce")
-        .fillna(0.0)
-        .abs()
-        .round()
-        .astype(int)
-    )
-
-    # Non-fall deductions inferred so that default mode always matches:
-    # D_eff = NonFall + (-Falls*1.0)  =>  NonFall = D_eff + Falls
-    seg["NonFall_Deductions"] = (seg["Deductions_Effective"] + seg["Falls"] * 1.0).round(2)
+    # Keep non-fall deductions fixed using element-level fall detection:
+    # Total_Deductions = NonFall + (-Falls*1.0)  => NonFall = Total_Deductions + Falls
+    seg["NonFall_Deductions"] = (seg["Total_Deductions"] + seg["Falls"] * 1.0).round(2)
 
     # New deductions: keep non-fall same, change only the fall part
-    seg["Total_Deductions_new"] = (seg["NonFall_Deductions"] - seg["Falls"] * float(fall_pts)).round(2)
+    seg["Total_Deductions_new"] = (seg["NonFall_Deductions"] - seg["Falls"] * float(fall_pts_effective)).round(2)
 
     seg["Total_Segment_Score_new"] = (
         seg["Total_Element_Score_new"] + seg["Total_Component_Score"] + seg["Total_Deductions_new"]
@@ -363,7 +421,15 @@ def compute_segment_summaries(
 # Compute selected program + overall (SP+FS) under the same levers
 # -----------------------------
 event_df, seg_df = compute_segment_summaries(
-    event_df_raw, GOE_pct, base_scale, fall_value, type_scales=type_scales, rot_scales=rot_scales
+    event_df_raw,
+    GOE_pct,
+    base_scale,
+    fall_value,
+    type_scales=type_scales,
+    rot_scales=rot_scales,
+    ur_scales=ur_scales,
+    fall_bv_penalty_mode=fall_bv_penalty_mode,
+    fall_bv_multiplier=0.50,
 )
 
 summary_df = seg_df.copy()
@@ -374,7 +440,15 @@ summary_df.sort_values("Original_Rank", inplace=True)
 # Overall standings within year+discipline (Short + Free)
 year_disc_df_raw = df_sim[(df_sim["Year"] == selected_year) & (df_sim["Discipline"] == disc_code)].copy()
 _, year_seg_df = compute_segment_summaries(
-    year_disc_df_raw, GOE_pct, base_scale, fall_value, type_scales=type_scales, rot_scales=rot_scales
+    year_disc_df_raw,
+    GOE_pct,
+    base_scale,
+    fall_value,
+    type_scales=type_scales,
+    rot_scales=rot_scales,
+    ur_scales=ur_scales,
+    fall_bv_penalty_mode=fall_bv_penalty_mode,
+    fall_bv_multiplier=0.50,
 )
 
 overall = (
@@ -607,37 +681,53 @@ with tab2:
         skater_elems["Element_Number"] = pd.to_numeric(skater_elems["Element_Number"], errors="coerce")
         skater_elems.sort_values("Element_Number", inplace=True)
 
-    for col in ["Element_Score", "Base_Value", "GOE_Mid7_Avg", "Element_Score_new", "Jump_Rotation"]:
+    for col in [
+        "Element_Score", "Base_Value", "GOE", "GOE_Mid7_Avg",
+        "Base_Value_new", "GOE_points_new", "Element_Score_new", "Jump_Rotation", "BV_Scale_Used"
+    ]:
         if col in skater_elems.columns:
             skater_elems[col] = pd.to_numeric(skater_elems[col], errors="coerce")
 
     breakdown_cols = [
         "Element_Name", "Element_Type_sim", "Jump_Rotation",
-        "Base_Value", "GOE_Mid7_Avg", "Element_Score", "Element_Score_new"
+        "Info_Column" if "Info_Column" in skater_elems.columns else None,
+        "Base_Value", "GOE", "Element_Score",
+        "Base_Value_new", "GOE_points_new", "Element_Score_new",
+        "BV_Scale_Used",
     ]
+    breakdown_cols = [c for c in breakdown_cols if c is not None and c in skater_elems.columns]
     breakdown_df = skater_elems[breakdown_cols].copy()
 
-    breakdown_df.rename(
-        columns={
-            "Element_Name": "Element",
-            "Element_Type_sim": "Type",
-            "Jump_Rotation": "Rot",
-            "Base_Value": "Base Value",
-            "GOE_Mid7_Avg": "GOE avg",
-            "Element_Score": "Original Score",
-            "Element_Score_new": "New Score",
-        },
-        inplace=True,
-    )
+    rename_map = {
+        "Element_Name": "Element",
+        "Element_Type_sim": "Type",
+        "Jump_Rotation": "Rot",
+        "Info_Column": "Info",
+        "Base_Value": "Base Value (orig)",
+        "GOE": "GOE pts (orig)",
+        "Element_Score": "Original Score",
+        "Base_Value_new": "Base Value (new)",
+        "GOE_points_new": "GOE pts (new)",
+        "Element_Score_new": "New Score",
+        "BV_Scale_Used": "BV Mult",
+    }
+    breakdown_df.rename(columns=rename_map, inplace=True)
 
-    breakdown_df["Base Value"] = breakdown_df["Base Value"].round(2)
-    breakdown_df["GOE avg"] = breakdown_df["GOE avg"].round(3)
-    breakdown_df["Original Score"] = breakdown_df["Original Score"].round(2)
-    breakdown_df["New Score"] = breakdown_df["New Score"].round(2)
+    if "Rot" in breakdown_df.columns:
+        breakdown_df["Rot"] = breakdown_df["Rot"].apply(lambda v: "–" if pd.isna(v) else str(int(v)))
+
+    for c in ["Base Value (orig)", "GOE pts (orig)", "Original Score", "Base Value (new)", "GOE pts (new)", "New Score", "BV Mult"]:
+        if c in breakdown_df.columns:
+            breakdown_df[c] = pd.to_numeric(breakdown_df[c], errors="coerce")
+
+    if "BV Mult" in breakdown_df.columns:
+        breakdown_df["BV Mult"] = breakdown_df["BV Mult"].round(3)
+
+    for c in ["Base Value (orig)", "GOE pts (orig)", "Original Score", "Base Value (new)", "GOE pts (new)", "New Score"]:
+        if c in breakdown_df.columns:
+            breakdown_df[c] = breakdown_df[c].round(2)
+
     breakdown_df["Change"] = (breakdown_df["New Score"] - breakdown_df["Original Score"]).round(2)
-
-    # show rotations as integers, dash otherwise
-    breakdown_df["Rot"] = breakdown_df["Rot"].apply(lambda v: "–" if pd.isna(v) else str(int(v)))
 
     def _color_elem_change(val):
         if pd.isna(val):
@@ -656,14 +746,22 @@ with tab2:
 
     st.dataframe(breakdown_style, use_container_width=True, hide_index=True)
 
-    falls = int(skater_sum["Falls"])
-    if falls > 0 and float(fall_value) != 1.0:
-        original_fall_part = -falls * 1.0
-        new_fall_part = -falls * float(fall_value)
-        st.write(
-            f"*This skater had {falls} fall(s) (inferred from reconciled deductions). "
-            f"Fall portion was {original_fall_part:.1f}, now {new_fall_part:.1f} under the new fall rule.*"
-        )
+    falls = int(skater_sum.get("Falls", 0))
+    if fall_bv_penalty_mode:
+        if falls > 0:
+            st.write(
+                f"*This skater has **{falls}** element-level fall(s) (from the protocol Info column). "
+                f"Under the alternative rule: fall deductions are removed, and each fallen element’s BV (and proportional GOE) is multiplied by 0.50.*"
+            )
+    else:
+        if falls > 0 and float(fall_value) != 1.0:
+            original_fall_part = -falls * 1.0
+            new_fall_part = -falls * float(fall_value)
+            st.write(
+                f"*This skater has **{falls}** element-level fall(s) (from the protocol Info column). "
+                f"Fall portion was {original_fall_part:.1f}, now {new_fall_part:.1f} under the new fall-deduction setting. "
+                f"Other deductions are held constant.*"
+            )
 
     diff_chart = (
         alt.Chart(breakdown_df)
